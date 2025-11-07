@@ -8,6 +8,8 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import requests
+import time # Added for retry mechanism
+from requests.exceptions import RequestException # Specific exception for robustness
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
@@ -29,7 +31,6 @@ st.markdown("Predict when the International Space Station will be visible from y
 # --- Initial Setup and Caching ---
 
 # FIX: Initialize non-serializable Skyfield objects directly in the script's global scope.
-# Streamlit runs this only once when the script is first loaded, avoiding caching serialization issues.
 try:
     # Load Skyfield timescale
     ts = load.timescale()
@@ -50,27 +51,49 @@ if 'observations_df' not in st.session_state:
         'pass_id', 'observation_time', 'weather', 'successful', 'notes', 'actual_altitude'
     ])
 
-# The function load_skyfield_data has been removed, as the objects are loaded above.
-
 @st.cache_data(ttl=3600)  # Cache TLE data for 1 hour
-def download_tle_data():
-    """Download current ISS TLE data from Celestrak"""
+def download_tle_data(max_retries=3, initial_delay=2, timeout=15):
+    """
+    Download current ISS TLE data from Celestrak with a retry mechanism.
+    Handles temporary network issues.
+    """
     tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
-    try:
-        response = requests.get(tle_url, timeout=10) # Added timeout for robustness
-        response.raise_for_status()
-        tle_lines = response.text.strip().split('\n')
-        
-        # Find ISS data
-        # Assuming the first set of TLE lines is the ISS based on CATNR=25544 query
-        for i, line in enumerate(tle_lines):
-            if 'ISS' in line or '25544' in line:
-                if i + 2 < len(tle_lines):
-                    return tle_lines[i:i+3]
-        raise ValueError("ISS data not found or file format changed.")
-    except Exception as e:
-        st.error(f"Error downloading TLE data: {e}")
-        return None
+    last_exception = None
+
+    for attempt in range(max_retries):
+        try:
+            # Increased timeout for better connection resilience
+            response = requests.get(tle_url, timeout=timeout)
+            response.raise_for_status()
+            
+            tle_lines = response.text.strip().split('\n')
+            
+            # Find ISS data
+            for i, line in enumerate(tle_lines):
+                if 'ISS' in line or '25544' in line:
+                    if i + 2 < len(tle_lines):
+                        return tle_lines[i:i+3]
+            
+            # If we reach here, data was downloaded but not found
+            raise ValueError("ISS data not found or file format changed.")
+
+        except RequestException as e:
+            last_exception = e
+            if attempt < max_retries - 1:
+                delay = initial_delay * (2 ** attempt)
+                st.warning(f"TLE download failed (Attempt {attempt + 1}/{max_retries}). Retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                # Last attempt failed
+                st.error(f"Error downloading TLE data after {max_retries} attempts: {e}")
+                return None
+        except Exception as e:
+            # Handle non-request exceptions (like ValueError from data parsing)
+            st.error(f"Error processing TLE data: {e}")
+            return None
+
+    # If the loop finishes without returning successfully, return None
+    return None
 
 def calculate_visible_passes(satellite, observer_location, start_time, days=7, min_altitude=10.0):
     """Calculate all visible ISS passes for a specified time period, including rise/set azimuth."""
@@ -114,9 +137,9 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
             brightness = -2.0 - (400 / distance_km) 
             
             pass_info = {
-                'rise_time': rise_time.utc_datetime(),
-                'max_alt_time': max_alt_time.utc_datetime(),
-                'set_time': set_time.utc_datetime(),
+                'rise_time': rise_time.utc_datetime().replace(tzinfo=None), # Make timezone naive
+                'max_alt_time': max_alt_time.utc_datetime().replace(tzinfo=None), # Make timezone naive
+                'set_time': set_time.utc_datetime().replace(tzinfo=None), # Make timezone naive
                 'max_altitude': round(max_altitude, 2),
                 'rise_azimuth': round(rise_az.degrees, 1),
                 'set_azimuth': round(set_az.degrees, 1),
@@ -165,10 +188,11 @@ with st.sidebar:
                     if all_passes:
                         predictions_df = pd.DataFrame(all_passes)
                         predictions_df['pass_id'] = range(1, len(predictions_df) + 1)
-                        # Convert datetime objects to timezone-naive datetimes for cleaner Streamlit display
-                        predictions_df['rise_time'] = predictions_df['rise_time'].dt.tz_localize(None)
-                        predictions_df['max_alt_time'] = predictions_df['max_alt_time'].dt.tz_localize(None)
-                        predictions_df['set_time'] = predictions_df['set_time'].dt.tz_localize(None)
+                        # The calculated times in the function are already timezone-naive, 
+                        # but we ensure dtypes are consistent across Streamlit runs.
+                        predictions_df['rise_time'] = pd.to_datetime(predictions_df['rise_time'])
+                        predictions_df['max_alt_time'] = pd.to_datetime(predictions_df['max_alt_time'])
+                        predictions_df['set_time'] = pd.to_datetime(predictions_df['set_time'])
                         
                         st.session_state.predictions_df = predictions_df
                         st.success(f"✅ Found {len(predictions_df)} passes!")
@@ -308,7 +332,7 @@ if st.session_state.predictions_df is not None:
             predictions_df['pass_id'] = pd.to_numeric(predictions_df['pass_id'], errors='coerce').astype('Int64')
             
             # Merge and filter only observed rows
-            # We use a right merge to ensure all logged observations are present, and then filter
+            # We use a left merge to combine predictions with corresponding observations
             merged_df = pd.merge(predictions_df, clean_observations_df, on='pass_id', how='left', suffixes=('_pred', '_obs'))
             observed_rows = merged_df[merged_df['successful'].notna()]
             
