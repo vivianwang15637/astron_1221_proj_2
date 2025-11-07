@@ -28,29 +28,36 @@ st.markdown("Predict when the International Space Station will be visible from y
 
 # --- Initial Setup and Caching ---
 
+# FIX: Initialize non-serializable Skyfield objects directly in the script's global scope.
+# Streamlit runs this only once when the script is first loaded, avoiding caching serialization issues.
+try:
+    # Load Skyfield timescale
+    ts = load.timescale()
+    # Load ephemeris (downloads de421.bsp if not present)
+    eph = load('de421.bsp')
+except Exception as e:
+    st.error(f"Failed to load Skyfield data: {e}. Please check your Skyfield installation.")
+    ts = None
+    eph = None
+
+
 # Initialize session state for persistent data
 if 'predictions_df' not in st.session_state:
     st.session_state.predictions_df = None
 if 'observations_df' not in st.session_state:
+    # Initialize with the correct columns, ready for concatenation
     st.session_state.observations_df = pd.DataFrame(columns=[
         'pass_id', 'observation_time', 'weather', 'successful', 'notes', 'actual_altitude'
     ])
 
-# FIX CONFIRMED: Using @st.cache_resource for non-serializable objects (ts, eph)
-@st.cache_resource
-def load_skyfield_data():
-    """Load Skyfield timescale and ephemeris (cached for performance)"""
-    ts = load.timescale()
-    # This will download de421.bsp automatically if not present
-    eph = load('de421.bsp')
-    return ts, eph
+# The function load_skyfield_data has been removed, as the objects are loaded above.
 
 @st.cache_data(ttl=3600)  # Cache TLE data for 1 hour
 def download_tle_data():
     """Download current ISS TLE data from Celestrak"""
     tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
     try:
-        response = requests.get(tle_url)
+        response = requests.get(tle_url, timeout=10) # Added timeout for robustness
         response.raise_for_status()
         tle_lines = response.text.strip().split('\n')
         
@@ -67,6 +74,10 @@ def download_tle_data():
 
 def calculate_visible_passes(satellite, observer_location, start_time, days=7, min_altitude=10.0):
     """Calculate all visible ISS passes for a specified time period, including rise/set azimuth."""
+    # Ensure ts is available before proceeding
+    if ts is None:
+        return []
+        
     end_time = start_time + days
     t, events = satellite.find_events(observer_location, start_time, end_time, altitude_degrees=min_altitude)
     
@@ -74,6 +85,7 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
     i = 0
     while i < len(events):
         # A pass is defined by: 0=Rise, 1=Max Alt, 2=Set
+        # Check if the sequence is (Rise, Max, Set)
         if i + 2 < len(events) and events[i] == 0 and events[i+1] == 1 and events[i+2] == 2:
             rise_time = t[i]
             max_alt_time = t[i+1]
@@ -98,6 +110,7 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
             
             distance_km = distance.km
             # Simple approximation of visual brightness (magnitude). Lower is brighter.
+            # Using 400km as a reference for roughly 0 magnitude
             brightness = -2.0 - (400 / distance_km) 
             
             pass_info = {
@@ -112,9 +125,9 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
             }
             
             passes.append(pass_info)
-            i += 3
+            i += 3 # Skip past Rise, Max, Set
         else:
-            i += 1
+            i += 1 # Move to the next event
     
     return passes
 
@@ -133,28 +146,34 @@ with st.sidebar:
     altitude_threshold = st.slider("Filter passes above (°)", 0.0, 90.0, 30.0, step=5.0)
     
     if st.button("🔄 Calculate Passes", type="primary"):
-        with st.spinner("Downloading TLE data and calculating passes..."):
-            # Load Skyfield using the resource cache
-            ts, eph = load_skyfield_data()
-            
-            # Download TLE
-            tle_data = download_tle_data()
-            if tle_data:
-                # EarthSatellite initialization is robust
-                satellite = EarthSatellite(tle_data[1], tle_data[2], tle_data[0], ts)
-                observer = Topos(latitude, longitude, elevation_m=elevation)
+        if ts is None or eph is None:
+            st.error("Cannot calculate passes because Skyfield data failed to load.")
+        else:
+            with st.spinner("Downloading TLE data and calculating passes..."):
                 
-                # Calculate passes
-                now = ts.now()
-                all_passes = calculate_visible_passes(satellite, observer, now, days=days_ahead, min_altitude=min_altitude)
-                
-                if all_passes:
-                    predictions_df = pd.DataFrame(all_passes)
-                    predictions_df['pass_id'] = range(1, len(predictions_df) + 1)
-                    st.session_state.predictions_df = predictions_df
-                    st.success(f"✅ Found {len(predictions_df)} passes!")
-                else:
-                    st.warning("No passes found for the specified criteria.")
+                # Download TLE
+                tle_data = download_tle_data()
+                if tle_data:
+                    # EarthSatellite initialization
+                    satellite = EarthSatellite(tle_data[1], tle_data[2], tle_data[0], ts)
+                    observer = Topos(latitude, longitude, elevation_m=elevation)
+                    
+                    # Calculate passes
+                    now = ts.now()
+                    all_passes = calculate_visible_passes(satellite, observer, now, days=days_ahead, min_altitude=min_altitude)
+                    
+                    if all_passes:
+                        predictions_df = pd.DataFrame(all_passes)
+                        predictions_df['pass_id'] = range(1, len(predictions_df) + 1)
+                        # Convert datetime objects to timezone-naive datetimes for cleaner Streamlit display
+                        predictions_df['rise_time'] = predictions_df['rise_time'].dt.tz_localize(None)
+                        predictions_df['max_alt_time'] = predictions_df['max_alt_time'].dt.tz_localize(None)
+                        predictions_df['set_time'] = predictions_df['set_time'].dt.tz_localize(None)
+                        
+                        st.session_state.predictions_df = predictions_df
+                        st.success(f"✅ Found {len(predictions_df)} passes!")
+                    else:
+                        st.warning("No passes found for the specified criteria.")
 
 # --- Main Content ---
 if st.session_state.predictions_df is not None:
@@ -246,8 +265,9 @@ if st.session_state.predictions_df is not None:
                 weather = st.selectbox("Weather", ["Clear", "Partly Cloudy", "Cloudy", "Overcast", "Rainy"])
                 successful = st.checkbox("Successfully Observed", value=True)
             with col2:
-                actual_altitude = st.number_input("Actual Altitude (°)", min_value=0.0, max_value=90.0, value=None, step=0.1, help="Estimate the highest point the ISS reached.")
-                notes = st.text_area("Notes", height=100)
+                # Use key to reset the input when a different pass is selected
+                actual_altitude = st.number_input("Actual Altitude (°)", min_value=0.0, max_value=90.0, value=None, step=0.1, key=f"altitude_input_{selected_pass_id}", help="Estimate the highest point the ISS reached.")
+                notes = st.text_area("Notes", height=100, key=f"notes_input_{selected_pass_id}")
             
             if st.button("💾 Save Observation"):
                 observation = {
@@ -259,10 +279,8 @@ if st.session_state.predictions_df is not None:
                     'actual_altitude': actual_altitude if actual_altitude else np.nan
                 }
                 
-                # Use st.dataframe to ensure the initial observations_df has correct dtype for numeric columns
+                # Use pd.concat to append the new observation
                 new_obs_df = pd.DataFrame([observation])
-                
-                # This logic correctly handles the initial creation and subsequent concatenation
                 st.session_state.observations_df = pd.concat([st.session_state.observations_df, new_obs_df], ignore_index=True)
                     
                 st.success("✅ Observation saved!")
@@ -272,7 +290,9 @@ if st.session_state.predictions_df is not None:
         # Show existing observations
         if not st.session_state.observations_df.empty:
             st.subheader("Your Observations")
-            st.dataframe(st.session_state.observations_df, use_container_width=True)
+            # Display only relevant columns, excluding potentially empty ones from initialization
+            display_obs_cols = [c for c in ['pass_id', 'observation_time', 'weather', 'successful', 'actual_altitude', 'notes'] if c in st.session_state.observations_df.columns]
+            st.dataframe(st.session_state.observations_df[display_obs_cols], use_container_width=True)
     
     # --- Tab 4: Analytics ---
     with tab4:
@@ -281,7 +301,6 @@ if st.session_state.predictions_df is not None:
         if not st.session_state.observations_df.empty:
             
             # Data cleaning and merge
-            observations_cols = ['pass_id', 'observation_time', 'weather', 'successful', 'notes', 'actual_altitude']
             clean_observations_df = st.session_state.observations_df.copy()
             
             # Ensure 'pass_id' is integer for reliable merge
@@ -289,7 +308,8 @@ if st.session_state.predictions_df is not None:
             predictions_df['pass_id'] = pd.to_numeric(predictions_df['pass_id'], errors='coerce').astype('Int64')
             
             # Merge and filter only observed rows
-            merged_df = pd.merge(predictions_df, clean_observations_df, on='pass_id', how='left')
+            # We use a right merge to ensure all logged observations are present, and then filter
+            merged_df = pd.merge(predictions_df, clean_observations_df, on='pass_id', how='left', suffixes=('_pred', '_obs'))
             observed_rows = merged_df[merged_df['successful'].notna()]
             
             total_observed = len(observed_rows)
@@ -346,7 +366,9 @@ if st.session_state.predictions_df is not None:
             if not st.session_state.observations_df.empty:
                 # Format datetime for CSV export
                 obs_df_export = st.session_state.observations_df.copy()
-                obs_df_export['observation_time'] = obs_df_export['observation_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                # Check if 'observation_time' is a datetime type before applying dt.strftime
+                if pd.api.types.is_datetime64_any_dtype(obs_df_export['observation_time']):
+                     obs_df_export['observation_time'] = obs_df_export['observation_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
                 csv_observations = obs_df_export.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 Download Observations",
@@ -356,14 +378,19 @@ if st.session_state.predictions_df is not None:
                 )
         
         with col3:
-            if not observed_rows.empty:
-                # Use the existing merged_df for full export
-                merged_df_export = merged_df.copy()
+            # Re-calculate merged_df if needed for export robustness
+            if not st.session_state.observations_df.empty:
+                merged_df_export = pd.merge(predictions_df, clean_observations_df, on='pass_id', how='left', suffixes=('_pred', '_obs'))
+                
                 # Format dates to strings before export
-                date_cols = ['rise_time', 'max_alt_time', 'set_time', 'observation_time']
+                date_cols = ['rise_time_pred', 'max_alt_time_pred', 'set_time_pred', 'observation_time']
                 for col in date_cols:
                     if col in merged_df_export.columns:
-                        merged_df_export[col] = merged_df_export[col].astype(str)
+                        # Attempt to convert datetime columns to string; ignore if already string
+                        try:
+                            merged_df_export[col] = merged_df_export[col].astype(str)
+                        except:
+                            pass # Column is likely already str or non-datetime
                 
                 csv_merged = merged_df_export.to_csv(index=False).encode('utf-8')
                 st.download_button(
