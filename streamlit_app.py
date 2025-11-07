@@ -52,10 +52,13 @@ if 'observations_df' not in st.session_state:
     ])
 
 @st.cache_data(ttl=3600)  # Cache TLE data for 1 hour
-def download_tle_data(max_retries=3, initial_delay=2, timeout=15):
+def download_tle_data(max_retries=5, initial_delay=3, timeout=20):
     """
     Download current ISS TLE data from Celestrak with a retry mechanism.
     Handles temporary network issues.
+    
+    INCREASED: max_retries (to 5), initial_delay (to 3s), and timeout (to 20s) 
+    for higher resilience against slow servers.
     """
     tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
     last_exception = None
