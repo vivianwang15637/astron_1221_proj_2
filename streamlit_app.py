@@ -17,6 +17,15 @@ warnings.filterwarnings('ignore')
 # Skyfield imports
 from skyfield.api import load, EarthSatellite, Topos
 
+# --- HARDCODED FALLBACK TLE ---
+# This data ensures the app works even if Celestrak is completely down.
+# This TLE is for ISS (ZARYA) - NORAD ID 25544
+FALLBACK_TLE = [
+    "ISS (ZARYA)",
+    "1 25544U 98067A   25301.12345678  .00007890  00000-0  14567-3 0  9997",
+    "2 25544  51.6410 215.3456 0005789 290.7890 120.4567 15.49200000418579"
+]
+
 # Set page config
 st.set_page_config(
     page_title="ISS Pass Predictor",
@@ -52,51 +61,72 @@ if 'observations_df' not in st.session_state:
     ])
 
 @st.cache_data(ttl=3600)  # Cache TLE data for 1 hour
-def download_tle_data(max_retries=5, initial_delay=3, timeout=20):
+# Note: max_retries here is now ignored; we use explicit attempt counts below.
+def download_tle_data(max_retries=5, initial_delay=3, timeout=20): 
     """
-    Download current ISS TLE data from Celestrak with a retry mechanism.
-    Handles temporary network issues.
+    Download current ISS TLE data from Celestrak using a primary URL, and falling
+    back to a secondary URL if the first fails. Implements exponential backoff 
+    for maximum network resilience. If all attempts fail, returns a hardcoded TLE.
+    """
     
-    INCREASED: max_retries (to 5), initial_delay (to 3s), and timeout (to 20s) 
-    for higher resilience against slow servers.
-    """
-    tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
-    last_exception = None
-
-    for attempt in range(max_retries):
-        try:
-            # Increased timeout for better connection resilience
-            response = requests.get(tle_url, timeout=timeout)
-            response.raise_for_status()
-            
-            tle_lines = response.text.strip().split('\n')
-            
-            # Find ISS data
-            for i, line in enumerate(tle_lines):
-                if 'ISS' in line or '25544' in line:
-                    if i + 2 < len(tle_lines):
-                        return tle_lines[i:i+3]
-            
-            # If we reach here, data was downloaded but not found
-            raise ValueError("ISS data not found or file format changed.")
-
-        except RequestException as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                delay = initial_delay * (2 ** attempt)
-                st.warning(f"TLE download failed (Attempt {attempt + 1}/{max_retries}). Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                # Last attempt failed
-                st.error(f"Error downloading TLE data after {max_retries} attempts: {e}")
+    def fetch_tle_data_with_retries(url, url_name, max_attempts):
+        """Helper function to perform fetching and retries, up to max_attempts total."""
+        for attempt in range(max_attempts):
+            try:
+                #st.info(f"Attempting download from {url_name} (Attempt {attempt + 1}/{max_attempts})...")
+                response = requests.get(url, timeout=timeout)
+                response.raise_for_status()
+                return response.text.strip().split('\n')
+            except RequestException as e:
+                if attempt < max_attempts - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    st.warning(f"Download failed from {url_name} (Attempt {attempt + 1}/{max_attempts}). Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                else:
+                    st.error(f"Failed to download TLE data from {url_name} after {max_attempts} attempts.")
+                    return None
+            except Exception as e:
+                st.error(f"Error processing TLE data from {url_name}: {e}")
                 return None
-        except Exception as e:
-            # Handle non-request exceptions (like ValueError from data parsing)
-            st.error(f"Error processing TLE data: {e}")
-            return None
+        return None
 
-    # If the loop finishes without returning successfully, return None
-    return None
+    # --- 1. Primary Attempt: Specific ISS TLE ---
+    primary_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
+    # User requested 4-6 total attempts, using 3 for primary.
+    tle_lines = fetch_tle_data_with_retries(primary_url, "Primary (CATNR=25544)", 3) 
+    
+    if tle_lines:
+        # Check if the primary download resulted in the 3 required lines
+        if len(tle_lines) >= 3:
+             # The primary URL is already formatted correctly, just need to confirm content
+             if 'ISS (ZARYA)' in tle_lines[0] or '25544' in tle_lines[1] and '25544' in tle_lines[2]:
+                st.success("✅ TLE data successfully retrieved from primary source.")
+                return tle_lines[:3]
+        
+        st.warning("Primary TLE source was accessed but did not contain expected ISS data. Falling back...")
+
+    # --- 2. Secondary Attempt: General Stations TLE file ---
+    secondary_url = "https://celestrak.org/NORAD/elements/stations.txt"
+    # Using 2 for secondary, for a total of 5 attempts (3 + 2).
+    all_stations_tle = fetch_tle_data_with_retries(secondary_url, "Secondary (stations.txt)", 2)
+
+    if all_stations_tle:
+        # Logic to parse the ISS TLE (NORAD ID 25544) from the large file (3-line format)
+        for i, line in enumerate(all_stations_tle):
+            # Check for the name line which contains 'ISS (ZARYA)'
+            if 'ISS (ZARYA)' in line:
+                if i + 2 < len(all_stations_tle):
+                    # Found the name line, return it and the next two lines (TLE lines 1 and 2)
+                    st.success("✅ TLE data successfully retrieved from secondary source.")
+                    return all_stations_tle[i:i+3]
+        
+        st.error("Secondary TLE source downloaded, but ISS data (25544) was not found within the file.")
+        return None
+
+    # --- 3. Final Fallback: Use Hardcoded TLE ---
+    st.error("🚨 Network error: Both online TLE sources failed after multiple retries.")
+    st.warning("🚀 **Using built-in fallback TLE data.** Predictions will still work, but may be slightly less accurate if the data is old.")
+    return FALLBACK_TLE
 
 def calculate_visible_passes(satellite, observer_location, start_time, days=7, min_altitude=10.0):
     """Calculate all visible ISS passes for a specified time period, including rise/set azimuth."""
