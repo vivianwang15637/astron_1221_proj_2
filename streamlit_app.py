@@ -26,7 +26,9 @@ st.set_page_config(
 st.title("🛰️ ISS Pass Predictor & Logger")
 st.markdown("Predict when the International Space Station will be visible from your location!")
 
-# Initialize session state
+# --- Initial Setup and Caching ---
+
+# Initialize session state for persistent data
 if 'predictions_df' not in st.session_state:
     st.session_state.predictions_df = None
 if 'observations_df' not in st.session_state:
@@ -34,7 +36,8 @@ if 'observations_df' not in st.session_state:
         'pass_id', 'observation_time', 'weather', 'successful', 'notes', 'actual_altitude'
     ])
 
-@st.cache_data
+# FIX CONFIRMED: Using @st.cache_resource for non-serializable objects (ts, eph)
+@st.cache_resource
 def load_skyfield_data():
     """Load Skyfield timescale and ephemeris (cached for performance)"""
     ts = load.timescale()
@@ -42,7 +45,7 @@ def load_skyfield_data():
     eph = load('de421.bsp')
     return ts, eph
 
-@st.cache_data(ttl=3600)  # Cache for 1 hour
+@st.cache_data(ttl=3600)  # Cache TLE data for 1 hour
 def download_tle_data():
     """Download current ISS TLE data from Celestrak"""
     tle_url = "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544"
@@ -52,23 +55,25 @@ def download_tle_data():
         tle_lines = response.text.strip().split('\n')
         
         # Find ISS data
+        # Assuming the first set of TLE lines is the ISS based on CATNR=25544 query
         for i, line in enumerate(tle_lines):
             if 'ISS' in line or '25544' in line:
                 if i + 2 < len(tle_lines):
                     return tle_lines[i:i+3]
-        raise ValueError("ISS data not found")
+        raise ValueError("ISS data not found or file format changed.")
     except Exception as e:
         st.error(f"Error downloading TLE data: {e}")
         return None
 
 def calculate_visible_passes(satellite, observer_location, start_time, days=7, min_altitude=10.0):
-    """Calculate all visible ISS passes for a specified time period."""
+    """Calculate all visible ISS passes for a specified time period, including rise/set azimuth."""
     end_time = start_time + days
     t, events = satellite.find_events(observer_location, start_time, end_time, altitude_degrees=min_altitude)
     
     passes = []
     i = 0
     while i < len(events):
+        # A pass is defined by: 0=Rise, 1=Max Alt, 2=Set
         if i + 2 < len(events) and events[i] == 0 and events[i+1] == 1 and events[i+2] == 2:
             rise_time = t[i]
             max_alt_time = t[i+1]
@@ -77,18 +82,31 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
             duration_minutes = (set_time - rise_time) * 24 * 60
             
             difference = satellite - observer_location
-            topocentric = difference.at(max_alt_time)
-            alt, az, distance = topocentric.altaz()
-            max_altitude = alt.degrees
+            
+            # Max Altitude and Brightness
+            topocentric_max = difference.at(max_alt_time)
+            alt_max, az_max, distance = topocentric_max.altaz()
+            max_altitude = alt_max.degrees
+            
+            # Rise Azimuth (Horizon to Max Alt)
+            topocentric_rise = difference.at(rise_time)
+            _, rise_az, _ = topocentric_rise.altaz()
+            
+            # Set Azimuth (Max Alt to Horizon)
+            topocentric_set = difference.at(set_time)
+            _, set_az, _ = topocentric_set.altaz()
             
             distance_km = distance.km
-            brightness = 0.0 - (400 / distance_km)
+            # Simple approximation of visual brightness (magnitude). Lower is brighter.
+            brightness = -2.0 - (400 / distance_km) 
             
             pass_info = {
                 'rise_time': rise_time.utc_datetime(),
                 'max_alt_time': max_alt_time.utc_datetime(),
                 'set_time': set_time.utc_datetime(),
                 'max_altitude': round(max_altitude, 2),
+                'rise_azimuth': round(rise_az.degrees, 1),
+                'set_azimuth': round(set_az.degrees, 1),
                 'duration_minutes': round(duration_minutes, 1),
                 'brightness': round(brightness, 2)
             }
@@ -100,7 +118,7 @@ def calculate_visible_passes(satellite, observer_location, start_time, days=7, m
     
     return passes
 
-# Sidebar for configuration
+# --- Sidebar Configuration ---
 with st.sidebar:
     st.header("⚙️ Configuration")
     
@@ -116,12 +134,13 @@ with st.sidebar:
     
     if st.button("🔄 Calculate Passes", type="primary"):
         with st.spinner("Downloading TLE data and calculating passes..."):
-            # Load Skyfield
+            # Load Skyfield using the resource cache
             ts, eph = load_skyfield_data()
             
             # Download TLE
             tle_data = download_tle_data()
             if tle_data:
+                # EarthSatellite initialization is robust
                 satellite = EarthSatellite(tle_data[1], tle_data[2], tle_data[0], ts)
                 observer = Topos(latitude, longitude, elevation_m=elevation)
                 
@@ -137,18 +156,32 @@ with st.sidebar:
                 else:
                     st.warning("No passes found for the specified criteria.")
 
-# Main content
+# --- Main Content ---
 if st.session_state.predictions_df is not None:
     predictions_df = st.session_state.predictions_df
+    
+    # Location Map Enhancement
+    st.subheader("🌍 Observer Location")
+    location_data = pd.DataFrame({'lat': [latitude], 'lon': [longitude]})
+    st.map(location_data, zoom=9)
     
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Predictions", "⭐ Best Passes", "📝 Log Observation", "📈 Analytics"])
     
+    # --- Tab 1: Predictions ---
     with tab1:
         st.header("All Predictions")
+        
+        display_cols = [
+            'pass_id', 'rise_time', 'max_alt_time', 'max_altitude', 
+            'rise_azimuth', 'set_azimuth', 'duration_minutes', 'brightness'
+        ]
+        
         st.dataframe(
-            predictions_df[['pass_id', 'rise_time', 'max_altitude', 'duration_minutes', 'brightness']].style.format({
+            predictions_df[display_cols].style.format({
                 'max_altitude': '{:.1f}°',
+                'rise_azimuth': '{:.1f}°',
+                'set_azimuth': '{:.1f}°',
                 'duration_minutes': '{:.1f} min',
                 'brightness': '{:.2f}'
             }),
@@ -168,15 +201,18 @@ if st.session_state.predictions_df is not None:
         plt.tight_layout()
         st.pyplot(fig)
     
+    # --- Tab 2: Best Passes ---
     with tab2:
         st.header(f"Best Passes (Above {altitude_threshold}°)")
         good_passes = predictions_df[predictions_df['max_altitude'] >= altitude_threshold]
         
         if len(good_passes) > 0:
-            st.metric("Good Passes", len(good_passes))
+            st.metric("Good Passes Found", len(good_passes))
             st.dataframe(
-                good_passes[['pass_id', 'rise_time', 'max_altitude', 'duration_minutes', 'brightness']].style.format({
+                good_passes[display_cols].style.format({
                     'max_altitude': '{:.1f}°',
+                    'rise_azimuth': '{:.1f}°',
+                    'set_azimuth': '{:.1f}°',
                     'duration_minutes': '{:.1f} min',
                     'brightness': '{:.2f}'
                 }),
@@ -185,95 +221,120 @@ if st.session_state.predictions_df is not None:
         else:
             st.info(f"No passes found above {altitude_threshold}°")
     
+    # --- Tab 3: Log Observation ---
     with tab3:
         st.header("Log an Observation")
         
         if len(predictions_df) > 0:
-            pass_id = st.selectbox(
-                "Select Pass ID",
-                options=sorted(predictions_df['pass_id'].tolist()),
-                format_func=lambda x: f"Pass {x} - {predictions_df[predictions_df['pass_id']==x]['rise_time'].iloc[0].strftime('%Y-%m-%d %H:%M')}"
+            
+            # Create a user-friendly format for the select box
+            pass_options = predictions_df.apply(
+                lambda row: f"Pass {row['pass_id']} - {row['rise_time'].strftime('%Y-%m-%d %H:%M')} (Max Alt: {row['max_altitude']:.1f}°)",
+                axis=1
+            ).tolist()
+            
+            selected_option = st.selectbox(
+                "Select Pass to Log",
+                options=pass_options
             )
+            
+            # Extract the pass_id from the selected string
+            selected_pass_id = int(selected_option.split(' - ')[0].replace('Pass ', ''))
             
             col1, col2 = st.columns(2)
             with col1:
                 weather = st.selectbox("Weather", ["Clear", "Partly Cloudy", "Cloudy", "Overcast", "Rainy"])
                 successful = st.checkbox("Successfully Observed", value=True)
             with col2:
+                actual_altitude = st.number_input("Actual Altitude (°)", min_value=0.0, max_value=90.0, value=None, step=0.1, help="Estimate the highest point the ISS reached.")
                 notes = st.text_area("Notes", height=100)
-                actual_altitude = st.number_input("Actual Altitude (°)", min_value=0.0, max_value=90.0, value=None, step=0.1)
             
             if st.button("💾 Save Observation"):
                 observation = {
-                    'pass_id': pass_id,
+                    'pass_id': selected_pass_id, # Use the extracted ID
                     'observation_time': datetime.now(),
                     'weather': weather,
                     'successful': successful,
                     'notes': notes if notes else "",
-                    'actual_altitude': actual_altitude if actual_altitude else None
+                    'actual_altitude': actual_altitude if actual_altitude else np.nan
                 }
                 
-                new_obs = pd.DataFrame([observation])
-                st.session_state.observations_df = pd.concat([st.session_state.observations_df, new_obs], ignore_index=True)
-                st.success("✅ Observation saved!")
+                # Use st.dataframe to ensure the initial observations_df has correct dtype for numeric columns
+                new_obs_df = pd.DataFrame([observation])
                 
-                # Save to CSV
-                st.session_state.observations_df.to_csv('iss_observations.csv', index=False)
+                # This logic correctly handles the initial creation and subsequent concatenation
+                st.session_state.observations_df = pd.concat([st.session_state.observations_df, new_obs_df], ignore_index=True)
+                    
+                st.success("✅ Observation saved!")
+                # Force a re-run to clear the form visually
+                st.rerun() 
         
         # Show existing observations
-        if len(st.session_state.observations_df) > 0:
+        if not st.session_state.observations_df.empty:
             st.subheader("Your Observations")
             st.dataframe(st.session_state.observations_df, use_container_width=True)
     
+    # --- Tab 4: Analytics ---
     with tab4:
         st.header("Analytics")
         
-        if len(st.session_state.observations_df) > 0:
-            merged_df = pd.merge(
-                predictions_df,
-                st.session_state.observations_df,
-                on='pass_id',
-                how='left'
-            )
+        if not st.session_state.observations_df.empty:
             
-            # Success rate
-            total_observed = merged_df['successful'].notna().sum()
+            # Data cleaning and merge
+            observations_cols = ['pass_id', 'observation_time', 'weather', 'successful', 'notes', 'actual_altitude']
+            clean_observations_df = st.session_state.observations_df.copy()
+            
+            # Ensure 'pass_id' is integer for reliable merge
+            clean_observations_df['pass_id'] = pd.to_numeric(clean_observations_df['pass_id'], errors='coerce').astype('Int64')
+            predictions_df['pass_id'] = pd.to_numeric(predictions_df['pass_id'], errors='coerce').astype('Int64')
+            
+            # Merge and filter only observed rows
+            merged_df = pd.merge(predictions_df, clean_observations_df, on='pass_id', how='left')
+            observed_rows = merged_df[merged_df['successful'].notna()]
+            
+            total_observed = len(observed_rows)
+            
             if total_observed > 0:
-                success_count = merged_df['successful'].sum()
+                success_count = observed_rows['successful'].sum()
                 success_rate = success_count / total_observed
                 
-                col1, col2 = st.columns(2)
+                col1, col2 = st.columns([1, 2])
                 with col1:
                     st.metric("Success Rate", f"{success_rate:.1%}")
                     st.metric("Total Observations", total_observed)
                 
                 with col2:
                     # Pie chart
-                    fig, ax = plt.subplots(figsize=(6, 6))
+                    fig, ax = plt.subplots(figsize=(4, 4))
                     labels = ['Successful', 'Failed']
                     sizes = [success_count, total_observed - success_count]
-                    colors = ['green', 'red']
-                    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90)
+                    colors = ['#4CAF50', '#FF5722'] 
+                    ax.pie(sizes, labels=labels, colors=colors, autopct='%1.1f%%', startangle=90, wedgeprops={'edgecolor': 'black', 'linewidth': 1})
                     ax.set_title('Observation Success Rate')
                     st.pyplot(fig)
                 
                 # Weather analysis
-                if 'weather' in merged_df.columns:
+                if 'weather' in observed_rows.columns:
                     st.subheader("Success by Weather")
-                    weather_analysis = merged_df.groupby('weather')['successful'].agg(['mean', 'count']).round(2)
+                    weather_analysis = observed_rows.groupby('weather')['successful'].agg(['mean', 'count'])
                     weather_analysis.columns = ['Success Rate', 'Count']
+                    weather_analysis['Success Rate'] = (weather_analysis['Success Rate'] * 100).map('{:.1f}%'.format)
                     st.dataframe(weather_analysis)
             else:
-                st.info("No observations yet. Log some observations to see analytics!")
+                st.info("No completed observations yet. Log some to see analytics!")
         else:
-            st.info("No observations yet. Log some observations to see analytics!")
+            st.info("No observations yet. Log some to see analytics!")
         
         # Export data
         st.subheader("Export Data")
         col1, col2, col3 = st.columns(3)
         
         with col1:
-            csv_predictions = predictions_df.to_csv(index=False)
+            # Ensure predictions_df is clean before export
+            predictions_df['rise_time'] = predictions_df['rise_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            predictions_df['max_alt_time'] = predictions_df['max_alt_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            predictions_df['set_time'] = predictions_df['set_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            csv_predictions = predictions_df.to_csv(index=False).encode('utf-8')
             st.download_button(
                 label="📥 Download Predictions",
                 data=csv_predictions,
@@ -282,8 +343,11 @@ if st.session_state.predictions_df is not None:
             )
         
         with col2:
-            if len(st.session_state.observations_df) > 0:
-                csv_observations = st.session_state.observations_df.to_csv(index=False)
+            if not st.session_state.observations_df.empty:
+                # Format datetime for CSV export
+                obs_df_export = st.session_state.observations_df.copy()
+                obs_df_export['observation_time'] = obs_df_export['observation_time'].dt.strftime('%Y-%m-%d %H:%M:%S')
+                csv_observations = obs_df_export.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 Download Observations",
                     data=csv_observations,
@@ -292,9 +356,16 @@ if st.session_state.predictions_df is not None:
                 )
         
         with col3:
-            if len(st.session_state.observations_df) > 0:
-                merged_df = pd.merge(predictions_df, st.session_state.observations_df, on='pass_id', how='left')
-                csv_merged = merged_df.to_csv(index=False)
+            if not observed_rows.empty:
+                # Use the existing merged_df for full export
+                merged_df_export = merged_df.copy()
+                # Format dates to strings before export
+                date_cols = ['rise_time', 'max_alt_time', 'set_time', 'observation_time']
+                for col in date_cols:
+                    if col in merged_df_export.columns:
+                        merged_df_export[col] = merged_df_export[col].astype(str)
+                
+                csv_merged = merged_df_export.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label="📥 Download Full Data",
                     data=csv_merged,
@@ -303,7 +374,7 @@ if st.session_state.predictions_df is not None:
                 )
 
 else:
-    st.info("👈 Configure your location and click 'Calculate Passes' to get started!")
+    st.info("<-- Configure your location and click 'Calculate Passes' to get started!")
     
     # Instructions
     with st.expander("ℹ️ How to Use"):
@@ -311,7 +382,7 @@ else:
         1. **Set your location** in the sidebar (latitude, longitude, elevation)
         2. **Adjust prediction settings** (days ahead, minimum altitude)
         3. **Click "Calculate Passes"** to get ISS predictions
-        4. **View predictions** in the Predictions tab
+        4. **View predictions** in the Predictions tab (note the **Rise/Set Azimuths** to know where to look!)
         5. **Check "Best Passes"** for high-altitude passes (easiest to see)
         6. **Log observations** after watching a pass
         7. **View analytics** to see your success rate
@@ -320,12 +391,15 @@ else:
     st.markdown("""
     ### About
     This app predicts when the International Space Station will be visible from your location.
-    The ISS orbits Earth every ~90 minutes, but you can only see it during twilight when it's
+    The ISS orbits Earth every ~90 minutes, but you can only see it during **twilight** when it's
     illuminated by the sun while your location is in darkness.
     
-    **Altitude Guide:**
-    - 0° = Horizon
-    - 30° = Good viewing (above most buildings)
-    - 90° = Directly overhead
+    **Altitude & Direction Guide:**
+    - **0° Altitude** = Horizon
+    - **30° Altitude** = Good viewing (above most buildings)
+    - **90° Altitude** = Directly overhead (the best view!)
+    - **0° Azimuth** = North
+    - **90° Azimuth** = East
+    - **180° Azimuth** = South
+    - **270° Azimuth** = West
     """)
-
